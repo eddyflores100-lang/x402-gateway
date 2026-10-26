@@ -7,7 +7,7 @@ import { x402Gateway } from '../src/hono.js';
 import { robotsRoute, x402Proxy } from '../src/next.js';
 import { mintPass, readPass } from '../src/pass.js';
 import { robotsTxt } from '../src/robots.js';
-import { buildOffer, decodePayment, expectedFor, METHODS } from '../src/x402.js';
+import { buildOffer, decodePayment, expectedFor, METHODS, nanoPayee, nonceOf, validBeforeOf, xnoRaw } from '../src/x402.js';
 
 const META = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (compatible; meta-externalagent/1.1 (+https://developers.facebook.com/docs/sharing/webmasters/crawler))';
 const CHROME = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0 Safari/537.36';
@@ -161,6 +161,95 @@ describe('the x402 offer', () => {
     assert.equal(expectedFor(decodePayment(proof({ network: 'eip155:999' })), offer), null);
     assert.equal(decodePayment('not base64 json'), null);
     assert.equal(decodePayment(''), null);
+  });
+});
+
+describe('XNO on Nano, opt-in', () => {
+  const NANO = 'nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3';
+  const RAW_AT_080 = '1250000000000000000000000000000'; // $1 at $0.80 per XNO: 1.25 XNO
+  const BLOCK = 'A'.repeat(64);
+
+  it('lists a nano entry in raw when the gateway has a Nano payee, after the USDC ones', async () => {
+    const { gateway } = gatewayFor({ nano: { payTo: NANO, rate: 0.8 } });
+    const body = await (await gateway.handle(req('/crawl', { accept: 'application/json' }))).json();
+    assert.deepEqual(body.accepts.map((a) => a.network), ['eip155:8453', 'eip155:137', 'eip155:1', 'nano']);
+    const xno = body.accepts[3];
+    assert.equal(xno.amount, RAW_AT_080);
+    assert.equal(xno.payTo, NANO);
+    assert.equal(xno.asset, 'XNO');
+    assert.equal(xno.scheme, 'exact');
+    // The USDC entries are the ones a gateway without a Nano payee offers.
+    const { gateway: plain } = gatewayFor();
+    const before = await (await plain.handle(req('/crawl', { accept: 'application/json' }))).json();
+    assert.deepEqual(body.accepts.slice(0, 3), before.accepts);
+  });
+  it('offers nothing new without a valid Nano payee', async () => {
+    const plain = buildOffer({ payTo: PAY_TO, priceCents: 100, resource: 'r' });
+    assert.deepEqual(buildOffer({ payTo: PAY_TO, priceCents: 100, resource: 'r', nano: null }), plain);
+    assert.deepEqual(buildOffer({ payTo: PAY_TO, priceCents: 100, resource: 'r', nano: { payTo: PAY_TO, amount: '1' } }), plain);
+    assert.deepEqual(buildOffer({ payTo: PAY_TO, priceCents: 100, resource: 'r', nano: { payTo: NANO, amount: '0' } }), plain);
+    for (const nano of [undefined, { payTo: '' }, { payTo: PAY_TO, rate: 0.8 }, { payTo: NANO }, { payTo: NANO, rate: 0 }]) {
+      const { gateway } = gatewayFor(nano ? { nano } : {});
+      const body = await (await gateway.handle(req('/crawl', { accept: 'application/json' }))).json();
+      assert.equal(body.accepts.length, 3);
+    }
+  });
+  it('normalises a legacy xrb_ payee to nano_', () => {
+    assert.equal(nanoPayee(`xrb_${NANO.slice(5)}`), NANO);
+    assert.equal(nanoPayee(NANO.toUpperCase()), NANO);
+    assert.equal(nanoPayee('nano_123'), null);
+    const offer = buildOffer({ payTo: PAY_TO, priceCents: 100, resource: 'r', nano: { payTo: `xrb_${NANO.slice(5)}`, amount: RAW_AT_080 } });
+    assert.equal(offer.accepts[3].payTo, NANO);
+  });
+  it('prices in raw with BigInt, rounding up', () => {
+    assert.equal(xnoRaw(100, 0.8), RAW_AT_080);
+    assert.equal(xnoRaw(100, 0.7), '1428571428571428571428571428572');
+    assert.equal(xnoRaw(100, 1), '1' + '0'.repeat(30));
+    assert.equal(xnoRaw(100, 0), null);
+    assert.equal(xnoRaw(100, Number.NaN), null);
+  });
+  it('sends CoinPay a v1 nano proof held to the nano payee and the raw amount, and mints a pass', async () => {
+    const sales = [];
+    const { gateway, cp } = gatewayFor({ nano: { payTo: NANO, rate: 0.8 }, onSale: (s) => sales.push(s) });
+    const header = toBase64({
+      x402Version: 2,
+      accepted: { scheme: 'exact', network: 'nano', amount: RAW_AT_080, asset: 'XNO', payTo: NANO },
+      payload: { blockHash: BLOCK },
+    });
+    const res = await gateway.handle(req('/events/1', { headers: { 'payment-signature': header } }));
+    assert.equal(res.status, 200);
+    assert.match((await res.json()).pass, /^cp_/);
+    const verify = cp.calls[0].body;
+    assert.deepEqual(verify.expected, { amount: RAW_AT_080, resource: 'https://example.test/crawl', payTo: NANO });
+    assert.notEqual(verify.payment.x402Version, 2);
+    assert.deepEqual(verify.payment.payload, {
+      blockHash: BLOCK,
+      network: 'nano',
+      scheme: 'exact',
+      to: NANO,
+      amount: RAW_AT_080,
+      resource: 'https://example.test/crawl',
+    });
+    assert.equal(cp.calls[1].body.payment.payload.blockHash, BLOCK);
+    assert.equal(sales[0].ref, BLOCK);
+  });
+  it('buys N days with N times one day in raw', async () => {
+    const { gateway, cp } = gatewayFor({ nano: { payTo: NANO, rate: 0.7 } });
+    const offer = await (await gateway.handle(req('/crawl?days=3', { accept: 'application/json' }))).json();
+    const three = offer.accepts.find((a) => a.network === 'nano').amount;
+    assert.equal(three, String(3n * BigInt(xnoRaw(100, 0.7))));
+    const header = toBase64({ x402Version: 1, scheme: 'exact', network: 'nano', payload: { network: 'nano', scheme: 'exact', to: NANO, amount: three, blockHash: BLOCK } });
+    const res = await gateway.handle(req('/crawl', { headers: { 'x-payment': header } }));
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).days, 3);
+    assert.equal(cp.calls[0].body.expected.amount, three);
+  });
+  it('leaves the EVM proof path as it was', () => {
+    const payment = decodePayment(proof());
+    assert.equal(payment.x402Version, 2);
+    assert.equal(nonceOf(payment), '0xabc');
+    assert.ok(validBeforeOf(payment) > 0);
+    assert.equal(validBeforeOf(decodePayment(toBase64({ network: 'nano', payload: { blockHash: BLOCK } }))), null);
   });
 });
 

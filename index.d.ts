@@ -74,6 +74,13 @@ export interface GatewayOptions {
   coinpay?: { apiKey?: string; baseUrl?: string };
   /** EVM address that receives the USDC. */
   payTo?: string;
+  /**
+   * Opt-in XNO on Nano: a `nano_` (or legacy `xrb_`) payee and the price of
+   * 1 XNO in `currency`, as a number or a function read per offer. Without a
+   * valid payee and a positive rate the offer is USDC only. CoinPay refuses
+   * Nano proofs unless its NANO_RPC_URL is set.
+   */
+  nano?: { payTo: string; rate: number | (() => number) };
   /** Default 100 ($1). */
   priceCents?: number;
   currency?: string;
@@ -192,7 +199,7 @@ export interface AcceptEntry {
   description: string;
   mimeType: string;
   maxTimeoutSeconds: number;
-  extra: { name: string; version: string };
+  extra: { name: string; version: string } | { decimals: number };
 }
 
 export interface Offer {
@@ -313,7 +320,11 @@ export function readPass(token: string, args: { secret: string; now?: number }):
 
 export const METHODS: Array<{ key: string; network: string; asset: string; label: string }>;
 export const X402_METHODS: typeof METHODS;
-export function buildOffer(args: { payTo: string; priceCents: number; resource: string; description?: string; maxTimeoutSeconds?: number; methods?: typeof METHODS }): Offer;
+export function buildOffer(args: { payTo: string; priceCents: number; resource: string; description?: string; maxTimeoutSeconds?: number; methods?: typeof METHODS; nano?: { payTo: string; amount: string } | null }): Offer;
+/** A Nano payee in canonical `nano_` form, or null. */
+export function nanoPayee(address: unknown): string | null;
+/** A price in raw XNO (10^30 per XNO), rounded up, at `rate` per XNO; null if either is not positive. */
+export function xnoRaw(priceCents: number, rate: number): string | null;
 export function decodePayment(header: string | null | undefined): Record<string, unknown> | null;
 export function decodeHeader(header: string | null | undefined): Record<string, unknown> | null;
 export function encodeHeader(value: unknown): string;
@@ -322,14 +333,14 @@ export function paymentResponseHeader(args: { transaction?: string | null; netwo
 export function renderNotice(ctx: { siteName: string; siteUrl: string; buyUrl: string; title: string; body: string }): string;
 export function renderPassPage(ctx: { siteName: string; siteUrl: string; buyUrl: string; token: string; expiresAt: string; days: number; header: string; cookie: string; email?: string | null }): string;
 export function sessionIdFromWebhook(body: unknown): string | null;
-export function expectedFor(payment: unknown, offer: Offer): { amount: string; resource: string; payTo: string; asset: string } | null;
+export function expectedFor(payment: unknown, offer: Offer): { amount: string; resource: string; payTo: string; asset?: string } | null;
 /** The value a proof authorizes, in the token's smallest unit, or null. */
 export function paidValueOf(payment: unknown): bigint | null;
 /** How many terms `value` buys at `unit` per term: a whole number in [1, maxDays], or 0. */
 export function daysPaid(value: bigint | null, unit: string | number | bigint, maxDays: number): number;
 export function verifyAndSettle(
   payment: unknown,
-  expected: { amount: string; resource: string; payTo: string; asset: string },
+  expected: { amount: string; resource: string; payTo: string; asset?: string },
   coinpay: { apiKey: string; baseUrl: string; fetch?: typeof fetch; metadata?: Record<string, unknown> | null },
 ): Promise<{ ok: true; payer: string | null; ref: string | null; txHash: string | null; network: string | null } | { ok: false; reason: string; replay: boolean }>;
 

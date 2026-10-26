@@ -83,6 +83,7 @@ export const GET = robotsRoute(gateway, { disallow: ['/login', '/api/'] });
 | `siteUrl` | required | canonical origin, no trailing slash |
 | `coinpay.apiKey` | | a **scoped** CoinPay key (`cp_live_…`, from the business's API Keys tab) with `payments:create`. The legacy business key is refused by CoinPay's x402 routes. |
 | `payTo` | | EVM address that receives the USDC, on Base, Polygon and Ethereum alike |
+| `nano` | off | `{ payTo: 'nano_…', rate }`: also offer XNO on network `nano`, paid straight to that address. `rate` is the price of 1 XNO in `currency` (a number, or a function read per offer); the amount is in raw (10^30 per XNO), rounded up. `xrb_` payees are rewritten to `nano_`. The buyer sends the block first and presents its hash, so a rate that moves between quote and proof refuses a payment already sent: keep it steady. CoinPay refuses every Nano proof unless its `NANO_RPC_URL` points at a Nano node |
 | `priceCents` | `100` | |
 | `passMinutes` | `1440` | a day: the term one price buys |
 | `maxDays` | `30` | the most terms one proof may buy at once |
@@ -206,6 +207,8 @@ The sales page shows a **Buy a day pass** form (email, days) whenever CoinPay se
 ## Which coins x402 offers
 
 USDC on Base, Polygon and Ethereum, and nothing else on purpose: CoinPay's v2 settle broadcasts EIP-3009 `transferWithAuthorization` only on chains 1, 137 and 8453, and USDC is the only EIP-3009 dollar token there (USDT has none). An offer for anything else would verify and never settle. Every other coin, and PayPal, is the checkout button's job.
+
+The exception, opt-in, is XNO with `nano` set. CoinPay settles network `nano` without a relayer: the buyer publishes a send block to `nano.payTo`, and CoinPay's verify and settle ask a Nano node that the block is a confirmed send of at least the quoted raw amount to that address. The block hash is the replay key and the pass's `ref`. CoinPay needs `NANO_RPC_URL` for this; without it every Nano proof is refused.
 
 ## Who is on which list
 

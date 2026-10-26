@@ -12,12 +12,14 @@ import {
   decodePayment,
   expectedFor,
   METHODS,
+  nanoPayee,
   nonceOf,
   paymentRequiredHeader,
   paymentResponseHeader,
   settleAgain,
   validBeforeOf,
   verifyAndSettle,
+  xnoRaw,
 } from './x402.js';
 
 export {
@@ -62,9 +64,11 @@ export {
   encodeHeader,
   expectedFor,
   METHODS,
+  nanoPayee,
   paymentRequiredHeader,
   paymentResponseHeader,
   verifyAndSettle,
+  xnoRaw,
 } from './x402.js';
 export { memoryQuotaStore, normaliseQuota, quotaHeaders, spend } from './quota.js';
 export { isPowerKey, keyFrom, PROFULLSTACK_KEYS, verifyKey } from '@profullstack/keys';
@@ -90,6 +94,7 @@ export { isPowerKey, keyFrom, PROFULLSTACK_KEYS, verifyKey } from '@profullstack
  * @param {string} [options.siteName]              for the page; defaults to the hostname
  * @param {{apiKey: string, baseUrl?: string}} [options.coinpay]  a SCOPED CoinPay key (cp_live_…) with payments:create
  * @param {string} [options.payTo]                 EVM address that receives the USDC
+ * @param {{payTo: string, rate: number|(() => number)}} [options.nano]  opt-in XNO on Nano: a nano_ (or xrb_) payee and the price of 1 XNO in `currency`; CoinPay must have NANO_RPC_URL set
  * @param {number} [options.priceCents=100]
  * @param {string} [options.currency='USD']
  * @param {number} [options.passMinutes=1440]          a day: the term one payment buys
@@ -215,6 +220,23 @@ export function createGateway(options = {}) {
     return Math.min(n, o.maxDays);
   };
 
+  /**
+   * The XNO entry's payee and raw amount for `days` terms, or null. `days`
+   * times one term's raw, never the raw of `days` times the price, so a proof
+   * for N terms is an exact multiple of the per-term amount, as for USDC.
+   */
+  const nanoFor = (days) => {
+    if (!o.nano) return null;
+    let rate;
+    try {
+      rate = typeof o.nano.rate === 'function' ? o.nano.rate() : o.nano.rate;
+    } catch {
+      return null;
+    }
+    const raw = xnoRaw(o.priceCents, rate);
+    return raw ? { payTo: o.nano.payTo, amount: String(BigInt(raw) * BigInt(days)) } : null;
+  };
+
   /** The offer for `days` terms: the same entries, `days` times the price. */
   const offer = (days = 1) =>
     enabled
@@ -223,6 +245,7 @@ export function createGateway(options = {}) {
           priceCents: o.priceCents * days,
           resource: buyUrl,
           description: `${days * o.passMinutes} minutes of crawl access to ${o.siteUrl}${days > 1 ? ` (${days} × ${o.passMinutes})` : ''}`,
+          nano: nanoFor(days),
         })
       : { x402Version: 2, accepts: [] };
 
@@ -957,7 +980,8 @@ export const wantsHtml = (accept = '') => String(accept ?? '').toLowerCase().inc
 
 /** The value a proof authorizes, in the token's smallest unit, or null. */
 export function paidValueOf(payment) {
-  const raw = payment?.payload?.authorization?.value;
+  // A Nano proof states its amount in raw; CoinPay then holds the block to the offer.
+  const raw = payment?.payload?.authorization?.value ?? (payment?.network === 'nano' ? payment?.payload?.amount : undefined);
   if (raw === undefined || raw === null || raw === '') return null;
   try {
     const value = BigInt(raw);
@@ -1007,6 +1031,7 @@ function normalise(options) {
       baseUrl: (options.coinpay?.baseUrl ?? 'https://coinpayportal.com').replace(/\/+$/, ''),
     },
     payTo: options.payTo ?? '',
+    nano: nanoPayee(options.nano?.payTo) ? { payTo: nanoPayee(options.nano.payTo), rate: options.nano.rate } : null,
     priceCents: Number.isFinite(options.priceCents) ? options.priceCents : 100,
     currency: options.currency ?? 'USD',
     passMinutes: Number.isFinite(options.passMinutes) && options.passMinutes > 0 ? options.passMinutes : 1440,

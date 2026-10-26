@@ -34,7 +34,9 @@
  * exactly 1, 137 and 8453, and USDC is the only EIP-3009 dollar token on them
  * (USDT has no EIP-3009). Advertising anything else would quote a payment
  * that verifies and then never settles. Buyers who want another coin, or
- * PayPal, use the hosted checkout on the sales page instead.
+ * PayPal, use the hosted checkout on the sales page instead. The one
+ * exception is XNO on Nano, which CoinPay settles by a node lookup rather
+ * than a relayer, and which `buildOffer` adds only when given a Nano payee.
  */
 export const METHODS = [
   {
@@ -61,6 +63,37 @@ const DECIMALS = 6;
 const DOMAIN = { name: 'USD Coin', version: '2' };
 
 /**
+ * XNO on Nano, opt-in: CoinPay verifies and settles network `nano` by asking a
+ * Nano node whether the proof's block is a confirmed send of at least the
+ * asking price to `payTo`. Nothing is signed or broadcast, so the buyer sends
+ * the block first and presents its hash. Amounts are in raw, 10^30 per XNO.
+ */
+const NANO_ADDRESS = /^(nano|xrb)_[13][13456789abcdefghijkmnopqrstuwxyz]{59}$/;
+
+/** A Nano payee in canonical `nano_` form, or null if it is not one. */
+export function nanoPayee(address) {
+  const a = String(address ?? '').trim().toLowerCase();
+  if (!NANO_ADDRESS.test(a)) return null;
+  return a.startsWith('xrb_') ? `nano_${a.slice(4)}` : a;
+}
+
+/**
+ * A price in raw XNO, rounded UP, at `rate` units of the price's currency per
+ * XNO. BigInt throughout: 10^30 is far past what a float holds exactly, and
+ * String() of a number that large is exponent notation no verifier parses.
+ * The rate is read to 10^-9 and the price to 10^-6 of a cent. Null if either
+ * is not a positive number.
+ */
+export function xnoRaw(priceCents, rate) {
+  const cents = BigInt(Math.round(Number(priceCents) * 1e6));
+  const per = BigInt(Number.isFinite(Number(rate)) ? Math.round(Number(rate) * 1e9) : 0);
+  if (cents <= 0n || per <= 0n) return null;
+  // raw = (cents / 100) / rate * 10^30 = (cents*1e6) * 10^31 / (rate*1e9)
+  const num = cents * 10n ** 31n;
+  return String((num + per - 1n) / per);
+}
+
+/**
  * A v2 402 body.
  *
  * `amount` is the price in the token's smallest unit, rounded UP: a fraction of
@@ -74,9 +107,32 @@ export function buildOffer({
   description = 'Payment required',
   maxTimeoutSeconds = 300,
   methods = METHODS,
+  nano = null,
 }) {
   if (!payTo) throw new Error('an offer needs a payTo address');
   const amount = String(Math.ceil((Number(priceCents) / 100) * 10 ** DECIMALS));
+  /*
+   * XNO goes last, and only with a real Nano payee and a raw amount: without
+   * both the offer is exactly the USDC one.
+   */
+  const xnoTo = nanoPayee(nano?.payTo);
+  const xno =
+    xnoTo && /^[1-9]\d*$/.test(String(nano.amount ?? ''))
+      ? [
+          {
+            scheme: 'exact',
+            network: 'nano',
+            amount: String(nano.amount),
+            asset: 'XNO',
+            payTo: xnoTo,
+            resource,
+            description,
+            mimeType: 'application/json',
+            maxTimeoutSeconds,
+            extra: { decimals: 30 },
+          },
+        ]
+      : [];
   return {
     x402Version: 2,
     accepts: methods.map((m) => ({
@@ -90,7 +146,7 @@ export function buildOffer({
       mimeType: 'application/json',
       maxTimeoutSeconds,
       extra: { ...DOMAIN },
-    })),
+    })).concat(xno),
   };
 }
 
@@ -137,6 +193,22 @@ export function decodePayment(header) {
     if (!parsed.network && chosen.network) parsed.network = chosen.network;
     if (!parsed.scheme && chosen.scheme) parsed.scheme = chosen.scheme;
     if (parsed.x402Version === undefined) parsed.x402Version = 2;
+  }
+  /*
+   * A Nano proof is a block hash, not an EIP-3009 authorization, and CoinPay
+   * reads it on its v1 path: `x402Version` must not be 2, and `network`,
+   * `scheme`, `to`, `amount` and `blockHash` are read from the payload. Lifted
+   * there from wherever this payer put them.
+   */
+  const network = String(parsed.network ?? parsed.payload?.network ?? '').toLowerCase();
+  if (network === 'nano') {
+    const payload = { ...(parsed.payload && typeof parsed.payload === 'object' ? parsed.payload : {}) };
+    payload.network = 'nano';
+    payload.scheme = payload.scheme || parsed.scheme || 'exact';
+    if (!payload.blockHash && parsed.blockHash) payload.blockHash = parsed.blockHash;
+    if (!payload.to && chosen?.payTo) payload.to = chosen.payTo;
+    if (payload.amount === undefined && chosen?.amount) payload.amount = String(chosen.amount);
+    return { ...parsed, x402Version: 1, scheme: payload.scheme, network: 'nano', payload };
   }
   return parsed;
 }
@@ -190,14 +262,24 @@ export function expectedFor(payment, offer) {
   const network = String(payment?.network ?? '').toLowerCase();
   const entry = (offer?.accepts ?? []).find((a) => a.network.toLowerCase() === network);
   if (!entry) return null;
+  /*
+   * XNO is Nano's native coin, which CoinPay's v1 check accepts only with no
+   * asset named on either side, or the same one named on both. The block is
+   * what proves the payment either way.
+   */
+  if (network === 'nano') {
+    const named = payment?.payload?.asset;
+    return { amount: entry.amount, resource: entry.resource, payTo: entry.payTo, ...(named ? { asset: entry.asset } : {}) };
+  }
   return { amount: entry.amount, resource: entry.resource, payTo: entry.payTo, asset: entry.asset };
 }
 
-/** The single-use nonce, which is what CoinPay keys replay detection on. */
-export const nonceOf = (payment) => payment?.payload?.authorization?.nonce ?? null;
+/** The single-use nonce, which is what CoinPay keys replay detection on: a Nano proof's is its block hash. */
+export const nonceOf = (payment) => payment?.payload?.authorization?.nonce ?? payment?.payload?.blockHash ?? null;
 
-/** When the payer's signature stops being valid, as a unix timestamp in seconds. */
+/** When the payer's signature stops being valid, as a unix timestamp in seconds. Null for Nano, which signs nothing with a deadline. */
 export const validBeforeOf = (payment) => {
+  if (String(payment?.network ?? '').toLowerCase() === 'nano') return null;
   const v = Number(payment?.payload?.authorization?.validBefore);
   return Number.isFinite(v) && v > 0 ? v : null;
 };
@@ -228,6 +310,14 @@ export async function verifyAndSettle(payment, expected, { apiKey, baseUrl, fetc
     return { status: res.status, json };
   };
 
+  /*
+   * A block cannot name the resource it bought, so for Nano the gateway names
+   * it: CoinPay compares `payload.resource` with `expected.resource` before it
+   * asks the node about the block.
+   */
+  if (String(payment?.network ?? '').toLowerCase() === 'nano' && payment.payload && !payment.payload.resource) {
+    payment = { ...payment, payload: { ...payment.payload, resource: expected.resource } };
+  }
   const v = await call('/api/x402/verify', { payment, expected });
   if (!v.json?.valid) {
     const reason = String(v.json?.error ?? v.json?.reason ?? `verify failed (${v.status})`);
